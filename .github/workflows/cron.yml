@@ -1,20 +1,23 @@
 name: Random Cron
+
 on:
-  workflow_run:
-    workflows: ["刷步数"]
-    types:
-      - completed
+  # 1. 解除死锁：改为定时触发，不再依赖 run.yml 是否成功
+  # 2. 避让覆盖：设置在 UTC 22:00（北京时间凌晨6点）运行，
+  #    这样它是在每天最开始时，为“新的一天”规划随机时间。
+  schedule:
+    - cron: '0 22 * * *'
   workflow_dispatch:
 
 jobs:
   repo-sync:
     runs-on: ubuntu-latest
     timeout-minutes: 3
-    if: github.event.workflow_run.conclusion == 'success' || github.event_name == 'workflow_dispatch'
+    # 3. 移除对 workflow_run 的 if 判断，因为不再依赖它了
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4 # 4. 升级到 v4，消除 Node.js 20 警告
         with:
-          token: ${{ secrets.PAT }} #此处PAT需要申请，教程详见：README
+          token: ${{ secrets.PAT }} # 此处 PAT 需要申请，教程详见：README
+
       - name: random cron
         run: |
           source cron_convert.sh
@@ -24,5 +27,6 @@ jobs:
           git config user.email github-actions@users.noreply.github.com
           git add .
           current=`TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M:%S'`
-          git commit -m "[${current}] random cron trigger by ${{ github.event_name }}"
+          # 5. 修复提交报错：没有文件变动就跳过 commit，防止 exit code 1
+          git diff --quiet && git diff --staged --quiet || git commit -m "[${current}] random cron trigger by ${{ github.event_name }}"
           git push origin master
