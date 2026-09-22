@@ -10,6 +10,7 @@ import random
 import re
 import time
 import os
+import requests
 
 from util.aes_help import encrypt_data, decrypt_data
 import util.zepp_helper as zeppHelper
@@ -37,6 +38,60 @@ def get_min_max_by_time(hour=None, minute=None):
     min_step = get_int_value_default(config, 'MIN_STEP', 18000)
     max_step = get_int_value_default(config, 'MAX_STEP', 25000)
     return int(time_rate * min_step), int(time_rate * max_step)
+
+
+# 检测天气，返回是否为极端天气
+def check_extreme_weather(city_name):
+    if not city_name:
+        return False
+
+    api_key = config.get("QWEATHER_KEY", "")
+    api_host = config.get("QWEATHER_HOST", "https://devapi.qweather.com")
+
+    if not api_key:
+        print("未配置和风天气 QWEATHER_KEY，跳过天气检测")
+        return False
+
+    try:
+        # 1. 通过城市名获取 Location ID
+        geo_url = f"{api_host}/geo/v2/city/lookup?location={city_name}&key={api_key}"
+        geo_res = requests.get(geo_url, timeout=10).json()
+
+        if geo_res.get("code") != "200" or not geo_res.get("location"):
+            print(f"和风天气获取城市失败，代码: {geo_res.get('code')}，跳过检测")
+            return False
+
+        location_id = geo_res["location"][0]["id"]
+
+        # 2. 获取实时天气
+        weather_url = f"{api_host}/v7/weather/now?location={location_id}&key={api_key}"
+        weather_res = requests.get(weather_url, timeout=10).json()
+
+        if weather_res.get("code") != "200":
+            print(f"和风天气获取天气失败，代码: {weather_res.get('code')}，跳过检测")
+            return False
+
+        weather_icon = weather_res["now"]["icon"]
+        weather_text = weather_res["now"]["text"]
+
+        # 3. 极端天气图标代码（雷暴、暴雨、雪、沙尘暴等）
+        extreme_codes = [
+            "302", "303", "304",
+            "310", "311", "312", "315", "316", "317", "318",
+            "403", "404", "405", "406", "407",
+            "503", "504", "507", "509", "510", "514", "515"
+        ]
+
+        if weather_icon in extreme_codes:
+            print(f"检测到城市 {city_name} 当前有极端天气：{weather_text}，步数将相应减少！")
+            return True
+        else:
+            print(f"城市 {city_name} 当前天气正常：{weather_text}")
+            return False
+
+    except Exception as e:
+        print(f"和风天气检测失败: {e}，按正常天气处理")
+        return False
 
 
 # 虚拟ip地址
@@ -110,8 +165,6 @@ class MiMotionRunner:
         else:
             self.is_phone = False
         self.user = user
-        # self.fake_ip_addr = fake_ip()
-        # self.log_str += f"创建虚拟ip地址：{self.fake_ip_addr}\n"
 
     # 登录
     def login(self):
@@ -158,7 +211,6 @@ class MiMotionRunner:
         if access_token is None:
             self.log_str += "登录获取accessToken失败：%s" % msg
             return None
-        # print(f"device_id:{self.device_id} isPhone: {self.is_phone}")
         login_token, app_token, user_id, msg = zeppHelper.grant_login_tokens(access_token, self.device_id,
                                                                              self.is_phone)
         if login_token is None:
@@ -188,10 +240,41 @@ class MiMotionRunner:
         if app_token is None:
             return "登陆失败！", False
 
-        step = str(random.randint(min_step, max_step))
-        self.log_str += f"已设置为随机步数范围({min_step}~{max_step}) 随机值:{step}\n"
-        
+        # 1. 获取当前时间（北京时间）
+        today_str = time_bj.strftime("%Y-%m-%d")
         user_token_info = user_tokens.get(self.user, {})
+
+        # 2. 新的一天，重置当日最大步数
+        if user_token_info.get("last_step_date") != today_str:
+            user_token_info["last_step_date"] = today_str
+            user_token_info["last_max_step"] = 0
+        last_max_step = user_token_info.get("last_max_step", 0)
+
+        # 3. 天气检测：极端天气压低上限
+        weather_city = config.get("WEATHER_CITY", "")
+        is_extreme = check_extreme_weather(weather_city)
+        if is_extreme:
+            max_step = min_step + random.randint(500, 1500)
+            self.log_str += f"极端天气预警：本次步数区间强制下调至 ({min_step}~{max_step})\n"
+
+        # 4. 防倒退：历史最大步数顶高当前下限
+        if last_max_step > min_step:
+            min_step = last_max_step
+        if min_step > max_step:
+            min_step = max_step
+
+        # 5. 随机取值
+        step = random.randint(min_step, max_step)
+        if step < last_max_step:
+            step = last_max_step
+
+        # 6. 更新缓存
+        user_token_info["last_max_step"] = step
+        user_tokens[self.user] = user_token_info
+
+        self.log_str += f"已设置为随机步数范围({min_step}~{max_step}) 实际设定值:{step}\n"
+
+        # 7. 设备绑定与执行
         bound_device_id = user_token_info.get("bound_device_id")
         if not bound_device_id and self.user_id:
             bound_device_id = zeppHelper.get_user_device_id(app_token, self.user_id)
@@ -200,7 +283,7 @@ class MiMotionRunner:
                 user_tokens[self.user] = user_token_info
                 self.log_str += f"查找到已绑定设备ID: {bound_device_id}\n"
 
-        ok, msg = zeppHelper.post_fake_brand_data(step, app_token, self.user_id, device_id=bound_device_id)
+        ok, msg = zeppHelper.post_fake_brand_data(str(step), app_token, self.user_id, device_id=bound_device_id)
         return f"修改步数（{step}）[" + msg + "]", ok
 
 
